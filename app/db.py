@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS batch_material (
 
 CREATE INDEX IF NOT EXISTS idx_batch_material_lot ON batch_material(lot_no);
 
+-- 批次作废：误登记、实际未投产的批次按批次号作废（原因非空）。
+-- 原登记行、裁决/资格当前快照与全部只增历史均保留供查询，批次号不可复用；
+-- 作废批次不参与同线残留传递、当前资格统计与新核验（由业务查询统一排除本表批号）。
+CREATE TABLE IF NOT EXISTS batch_void (
+    batch_no   TEXT PRIMARY KEY REFERENCES batch(batch_no),
+    reason     TEXT NOT NULL,               -- 作废原因（非空）
+    voided_at  TEXT NOT NULL
+);
+
 -- 原料批号待检锁定：每批号一行当前状态；只在“实际变化”时更新
 CREATE TABLE IF NOT EXISTS material_lot_lock (
     lot_no      TEXT PRIMARY KEY REFERENCES material_lot(lot_no),

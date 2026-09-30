@@ -17,6 +17,13 @@
 每次批号状态实际变化都使直接使用该批号的批次**出货资格版本**递增；未知批号、空原因拒绝，
 重复提交相同状态不产生新变更。
 
+生产现场可将**误登记、实际未投产**的批次按批次号和非空原因**作废**：作废保留原登记、
+历史裁决与出货资格及作废原因供查询，**批次号不可复用**；作废批次不再参与同线残留传递、
+当前资格统计或新核验。其后**有效**批次按原顺序重算裁决并追加版本（即使结论不变），
+涉及这些批次或作废批次的**已确认核验单转待复核**，历次确认快照不改；含作废批次的已有
+单据可查询，但**重新核验与确认均拒绝**。重复作废返回既有结果且不重算；未知批次、空原因
+拒绝，失败不留下部分版本。
+
 - 技术栈：Python 3.11 + FastAPI + SQLite（标准库 `sqlite3`，WAL 模式）
 - 数据落盘：单个 SQLite 文件，Docker 卷持久化
 - 一键启动：`docker compose up`（首次启动自动建表、写入过敏原字典与演示原料批号）
@@ -62,17 +69,51 @@
   - 重复提交相同状态**不产生新变更**（锁定历史与资格版本均不变，返回 `changed=false`）。
 - 已确认核验单所含批次的出货资格版本变化后，核验单立即转**待复核**。
 
+### 批次作废（误登记、实际未投产）
+
+生产现场可按批次号和**非空原因**将误登记、实际未投产的批次作废：
+
+- **只标记、不删除**：作废保留原登记内容、当前裁决与出货资格快照、全部只增历史
+  （裁决版本、资格版本、批号锁定历史）以及**作废原因与时间**供查询；作废批自身不产生
+  新裁决版本。**批次号不可复用**（再次登记返回 409 `DUPLICATE_BATCH`）。
+- **退出残留传递链**：作废批次不再向同线后续批次传递过敏原；重算时残留链自动跨过作废批
+  重新接到上一有效批（作废批之前的裁决保持不变）。
+- **后续有效批按原顺序重算**：从作废批的序号起，对其后全部**有效**批次重算并追加裁决
+  版本（`VOID_BATCH`）——**即使结论不变也追加版本**；作废批本身冻结不重算。新登记批次的
+  `seq` 续接登记顺序（序号不复用），残留只取上一有效批。
+- **退出当前资格统计**：作废批次不出入 `/api/eligibilities`；批号锁定/解除不联动、不触碰
+  其冻结的出货资格（单批 `/eligibility` 仍可查到作废时点的冻结快照与作废标记）。
+- **核验单联动**：
+  - 涉及作废批次本身、或涉及被重算后续批的**已确认**核验单立即转 `PENDING_REVIEW`
+    （草稿单不联动转态）；历次确认快照只追加保留、内容不改；
+  - 含作废批次的**已有单据可查询**（逐批与单据顶层均标作废状态），但**重新核验返回
+    409 `VERIFICATION_HAS_VOIDED_BATCH`、确认返回 422**（逐批 `BATCH_VOIDED` 明细），
+    确认失败不写入确认记录；
+  - **新建**核验单的批次列表含作废批时整体拒绝（400 `BATCH_VOIDED`）。
+- **作废批不得更正**（`PUT /api/batches/{batch_no}` 与 `/cleaning` 返回 409 `BATCH_VOIDED`）；
+  原料批号档案更正只重算引用它的有效批次，作废批裁决冻结不变。
+- **幂等**：重复作废返回首次作废的既有结果（`changed=false`、保留首次原因），不重算、
+  不产生新版本。
+- 查询标记：批次列表/详情/历史、单批资格查询、核验单详情都标明作废状态与原因；
+  作废批仍出现在批次列表中（不消失），但从当前资格统计中排除。
+
 拒绝规则（失败时整个请求回滚，**不留下部分改动**）：
 
 | 场景 | HTTP | error.code |
 | --- | --- | --- |
-| 批次号重复 | 409 | `DUPLICATE_BATCH` |
+| 批次号重复（含复用作废批次号） | 409 | `DUPLICATE_BATCH` |
 | 原料批号重复登记 | 409 | `DUPLICATE_MATERIAL_LOT` |
 | 批次引用了未登记的原料批号 | 400 | `UNKNOWN_MATERIAL_LOT` |
 | 过敏原代码不在受控字典内 | 400 | `INVALID_ALLERGEN` |
 | 字段为空/类型错误等负载问题 | 400/422 | `INVALID_PAYLOAD` / FastAPI 校验 |
 | 锁定/解除未登记的批号，或查询其状态 | 404 | `MATERIAL_LOT_NOT_FOUND` |
 | 锁定/解除原因为空或纯空白 | 400 | `INVALID_PAYLOAD` |
+| 作废未知批次 | 404 | `BATCH_NOT_FOUND` |
+| 作废原因为空或纯空白 | 400 | `INVALID_PAYLOAD` |
+| 更正作废批次 | 409 | `BATCH_VOIDED` |
+| 新建核验单的列表含作废批次 | 400 | `BATCH_VOIDED` |
+| 含作废批次的单据重新核验 | 409 | `VERIFICATION_HAS_VOIDED_BATCH` |
+| 含作废批次的单据确认 | 422 | `VERIFICATION_NOT_CONFIRMABLE`（明细 `BATCH_VOIDED`） |
 | 更正目标批次/原料批号不存在 | 404 | `CORRECTION_TARGET_NOT_FOUND` |
 | 查询不存在的批次/原料批号 | 404 | `BATCH_NOT_FOUND` / `MATERIAL_LOT_NOT_FOUND` |
 
@@ -114,7 +155,7 @@ python -m app
 
 ```bash
 pip install pytest httpx
-python -m pytest -q            # 52 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单
+python -m pytest -q            # 73 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废
 
 # 服务启动后，运行端到端调用示例（标准库 urllib，无需额外依赖）
 python examples/run_demo.py
@@ -127,6 +168,11 @@ BASE_URL=http://127.0.0.1:8080 python examples/verification_demo.py
 # 原料批号待检锁定端到端示例（锁定/解除/幂等/出货资格版本/残留不连带/核验单联动）
 python examples/lot_lock_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/lot_lock_demo.py
+
+# 批次作废端到端示例（作废/幂等/后续批重算追加版本/残留链跨过作废批/
+# 核验单转待复核/含作废批单据拒绝重新核验与确认/资格冻结/不可更正不可复用）
+python examples/batch_void_demo.py
+BASE_URL=http://127.0.0.1:8080 python examples/batch_void_demo.py
 ```
 
 ---
@@ -196,11 +242,12 @@ BASE_URL=http://127.0.0.1:8080 python examples/lot_lock_demo.py
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/batches` | **按产线顺序登记批次**，立即返回裁决（seq 自动取该线下一号） |
-| GET | `/api/batches?line_id=L1` | 列出批次（可按产线过滤） |
-| GET | `/api/batches/{batch_no}` | 查询批次及当前裁决快照 |
-| PUT | `/api/batches/{batch_no}` | **更正批次**（用料/声明/清洁，任一可选），重算本批及后续批次 |
-| PUT | `/api/batches/{batch_no}/cleaning` | 专用：仅更正开工前清洁核验确认清除的过敏原 |
-| GET | `/api/batches/{batch_no}/history` | 查询该批**历史裁决版本**（只追加，含触发原因与时间） |
+| GET | `/api/batches?line_id=L1` | 列出批次（可按产线过滤；作废批仍列出并带 `voided`/`void` 标记） |
+| GET | `/api/batches/{batch_no}` | 查询批次及当前裁决快照（含作废状态与原因） |
+| POST | `/api/batches/{batch_no}/void` | **作废误登记、实际未投产的批次**（请求体 `{"reason": "..."}`，必填非空白）；后续有效批按序重算追加版本 |
+| PUT | `/api/batches/{batch_no}` | **更正批次**（用料/声明/清洁，任一可选），重算本批及后续批次（作废批拒绝 409） |
+| PUT | `/api/batches/{batch_no}/cleaning` | 专用：仅更正开工前清洁核验确认清除的过敏原（作废批拒绝 409） |
+| GET | `/api/batches/{batch_no}/history` | 查询该批**历史裁决版本**（只追加，含触发原因与时间；作废批同样保留并标作废状态） |
 
 ### 出货资格
 
@@ -245,6 +292,48 @@ BASE_URL=http://127.0.0.1:8080 python examples/lot_lock_demo.py
 原料批号更正会列出各产线受影响批次。
 更正若重算了核验单所含批次，响应还附带 `affected_verifications`（含各核验单更正后的状态）。
 批次更正响应另含 `shipment_eligibility`（本次是否递增资格版本、版本号、状态、锁定批号）。
+
+### 批次作废
+
+`POST /api/batches/{batch_no}/void`，请求体仅一个必填原因：
+
+```json
+{ "reason": "生产现场核实为误登记，该批次实际未投产" }
+```
+
+响应（首次作废 `changed=true`）：
+
+```jsonc
+{
+  "batch_no": "B2026002", "line_id": "L1", "seq": 2,
+  "changed": true,                  // false=重复作废，返回既有结果、不重算
+  "void": {
+    "voided": true,
+    "reason": "生产现场核实为误登记，该批次实际未投产",
+    "voided_at": "2026-09-30T00:00:00+00:00"
+  },
+  "voided_batch": {                 // 作废批的完整冻结快照（原登记 + 裁决/资格，均不新增版本）
+    "batch_no": "B2026002", "line_id": "L1", "seq": 2,
+    "material_lots": ["RM-MILK-002"],
+    "declared_allergens": ["milk"], "cleaned_allergens": ["milk"],
+    "voided": true, "void": { /* 同上 */ },
+    "adjudication": { "version": 1, /* ...作废时点冻结的裁决... */ },
+    "shipment_eligibility": { "version": 1, "status": "SHIPPABLE", /* ...冻结资格... */ }
+  },
+  "recomputed": [                   // 其后“有效”批次按原顺序重算（即使结论不变也追加版本）
+    { "batch_no": "B2026003", "line_id": "L1", "seq": 3, "version": 2,
+      "actual": [], "undeclared": [], "disposition": "RELEASE", "reasons": [ /* ... */ ] }
+  ],
+  "affected_verifications": [       // 含作废批或被重算批的已确认单已转 PENDING_REVIEW
+    { "verification_no": "SH-001", "status": "PENDING_REVIEW", "updated_at": "..." }
+  ]
+}
+```
+
+作废后各查询接口的标记：批次详情/列表/历史含 `voided`（布尔）与 `void`（对象或 `null`）；
+单批资格查询同样标记，且其资格为**作废时点冻结快照**（锁定状态变化不再联动）；
+`/api/eligibilities` 当前统计**排除**作废批。核验单详情顶层含
+`has_voided_batches` / `voided_batches`，逐批记录含 `voided` 与 `void`。
 
 ### 出货核验单
 
@@ -326,7 +415,8 @@ DRAFT ──confirm 成功──▶ CONFIRMED
 | 单号为空 / 列表非数组 | 400 | `INVALID_PAYLOAD`（空列表为 422 模型校验） |
 | 核验单不存在 | 404 | `VERIFICATION_NOT_FOUND` |
 | 已确认单据再次确认或重新核验 | 409 | `VERIFICATION_ALREADY_CONFIRMED` |
-| 确认时存在不符批次 | 422 | `VERIFICATION_NOT_CONFIRMABLE`（`details` 逐批说明） |
+| 含作废批次的单据重新核验 | 409 | `VERIFICATION_HAS_VOIDED_BATCH` |
+| 确认时存在不符批次（含作废批） | 422 | `VERIFICATION_NOT_CONFIRMABLE`（`details` 逐批说明；作废批为 `BATCH_VOIDED`） |
 
 ---
 
@@ -405,6 +495,38 @@ curl -s -X POST http://127.0.0.1:8080/api/material-lots/RM-NUT-001/unlock \
 # 16) 核验单重新核验（刷新裁决+出货资格双快照）后再次确认
 curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-001/reverify
 curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-001/confirm
+
+# 17) 作废误登记、实际未投产的批次（原因必填非空白；批次号之后不可复用）
+curl -s -X POST http://127.0.0.1:8080/api/batches/B002/void \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"生产现场核实为误登记，该批次实际未投产"}'
+# -> changed=true；其后有效批（如 B003）按原顺序重算并追加版本（trigger=VOID_BATCH），
+#    含 B002 或 B003 的已确认核验单自动转 PENDING_REVIEW；确认快照不改。
+
+# 18) 重复作废：幂等返回首次结果（changed=false、recomputed 为空，不重算）
+curl -s -X POST http://127.0.0.1:8080/api/batches/B002/void \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"再次提交作废"}'
+
+# 19) 作废后的查询：详情/列表/历史均带 voided 与 void（原因/时间）；
+#     单批资格是作废时点冻结快照；/api/eligibilities 当前统计排除作废批
+curl -s http://127.0.0.1:8080/api/batches/B002
+curl -s http://127.0.0.1:8080/api/batches/B002/history
+curl -s http://127.0.0.1:8080/api/batches/B002/eligibility
+curl -s http://127.0.0.1:8080/api/eligibilities
+
+# 20) 作废批拒绝更正（409 BATCH_VOIDED）、批次号不可复用（409 DUPLICATE_BATCH）
+curl -s -X PUT http://127.0.0.1:8080/api/batches/B002 \
+  -H 'Content-Type: application/json' \
+  -d '{"declared_allergens":["milk"]}'
+
+# 21) 含作废批的已有单据可查；重新核验 409、确认 422（逐批 BATCH_VOIDED）；
+#     新建核验单引用作废批 400
+curl -s http://127.0.0.1:8080/api/verifications/SH-OLD
+curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-OLD/reverify
+curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-OLD/confirm
+
+# 未知批次作废 404 BATCH_NOT_FOUND；空原因 400 INVALID_PAYLOAD（失败不留部分版本）
 ```
 
 更多可运行示例见 [`examples/run_demo.py`](examples/run_demo.py)（包含完整的
@@ -412,7 +534,10 @@ curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-001/confirm
 出货核验单全流程示例见 [`examples/verification_demo.py`](examples/verification_demo.py)
 （创建 → HOLD 拦截 → 确认 → 更正转待复核 → 重新核验 → 二次确认与历史快照）；
 原料批号待检锁定全流程示例见 [`examples/lot_lock_demo.py`](examples/lot_lock_demo.py)
-（锁定 → 出货资格版本递增 → 残留不连带 → 确认拦截 → 待复核 → 解除 → 重新核验 → 二次确认）。
+（锁定 → 出货资格版本递增 → 残留不连带 → 确认拦截 → 待复核 → 解除 → 重新核验 → 二次确认）；
+批次作废全流程示例见 [`examples/batch_void_demo.py`](examples/batch_void_demo.py)
+（作废 → 幂等 → 后续有效批按序重算追加版本 → 残留链跨过作废批 → 已确认单转待复核 →
+含作废批旧单据查询与重新核验/确认拒绝 → 资格冻结 → 不可更正/不可复用 → 新单引用拒绝）。
 示例脚本可重复调用其中的“登记原料批号”接口（重复时自动跳过）；批次号固定，
 重复运行前如需重置可 `docker compose down -v` 后重新启动，或删除本地 `data/` 目录。
 
@@ -434,9 +559,11 @@ curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-001/confirm
 ├── examples/run_demo.py          # 裁决/更正/历史端到端调用示例
 ├── examples/verification_demo.py # 出货核验单端到端调用示例
 ├── examples/lot_lock_demo.py     # 原料批号待检锁定/出货资格端到端调用示例
+├── examples/batch_void_demo.py   # 批次作废/重算联动/旧单据冻结端到端调用示例
 ├── tests/test_service.py         # pytest 测试（裁决/更正/历史，20 项）
 ├── tests/test_verification.py    # pytest 测试（出货核验单，15 项）
-├── tests/test_lot_lock.py        # pytest 测试（批号锁定/出货资格/旧库升级，17 项）
+├── tests/test_lot_lock.py        # pytest 测试（批号锁定/出货资格/旧库升级，18 项）
+├── tests/test_batch_void.py      # pytest 测试（批次作废/传递重连/资格冻结/核验单联动，20 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -447,8 +574,10 @@ curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-001/confirm
 - `allergen`：过敏原字典
 - `material_lot`：原料批号 → 名称、过敏原集合
 - `line` / `batch` / `batch_material`：产线、批次（含 `line_id+seq` 唯一顺序）、批次用料关联
+- `batch_void`：批次作废记录（批次号、非空原因、作废时间）；原批次行与全部历史均保留，
+  批次号因此不可复用；业务查询统一排除该表批号以退出残留传递、资格统计与新核验
 - `adjudication`：每批当前裁决快照
-- `adjudication_version`：只追加的历史裁决版本（`REGISTER` / `CORRECT_BATCH` / `CORRECT_LOT`）
+- `adjudication_version`：只追加的历史裁决版本（`REGISTER` / `CORRECT_BATCH` / `CORRECT_LOT` / `VOID_BATCH`）
 - `material_lot_lock` / `material_lot_lock_version`：原料批号当前待检锁定状态与只追加的
   锁定/解除历史（`LOCK` / `UNLOCK`）
 - `shipment_eligibility` / `shipment_eligibility_version`：每批当前出货资格与只追加历史
@@ -460,7 +589,9 @@ curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-001/confirm
 所有写操作在单事务（`BEGIN IMMEDIATE`）内完成并进程内串行化，配合外键约束与 WAL，
 保证更正与登记的原子性：校验失败即整体回滚，不会产生半成品批次或半成品重算版本。
 核验单创建（未知/重复批次在写入前整体校验）、重新核验与确认（校验与确认记录写入同一事务，
-失败不留下确认记录）遵循同样的原子性保证；新表以 `CREATE TABLE IF NOT EXISTS` 幂等加入，
+失败不留下确认记录）遵循同样的原子性保证；批次作废同样在单事务内完成作废标记、后续批重算
+与核验单联动，未知批次/空原因回滚不留下部分作废或部分版本，重复作废直接返回既有结果不重算。
+新表以 `CREATE TABLE IF NOT EXISTS` 幂等加入，
 既有快照表新增列通过 `ALTER TABLE`（逐列检查）幂等补齐，旧数据库启动时自动升级，
 并为既有批次补出货资格 v1（`UPGRADE_INIT`，不改变既有核验单状态；升级前的旧确认快照
 出货资格字段为空，确认时要求先重新核验），既有批次裁决、更正与历史查询行为保持不变。
