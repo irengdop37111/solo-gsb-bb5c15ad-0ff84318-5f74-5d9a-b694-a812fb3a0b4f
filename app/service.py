@@ -106,9 +106,13 @@ def _adjudicate_batch(b: dict[str, Any], previous_actual: list[str]) -> dict[str
 
 
 def _load_batches(conn, line_id: str, start_seq: int) -> list[dict[str, Any]]:
-    """读取某产线从 start_seq 起的批次，并附上本批原料过敏原与批号来源。"""
+    """读取某产线从 start_seq 起的批次，并附上本批原料过敏原与批号来源。
+
+    已作废批次不参与裁决与同线残留传递：这里直接过滤掉它们
+    （其占用的 seq 产生空洞，后续有效批次按登记顺序继续）。
+    """
     rows = conn.execute(
-        "SELECT * FROM batch WHERE line_id = ? AND seq >= ? ORDER BY seq",
+        "SELECT * FROM batch WHERE line_id = ? AND seq >= ? AND status = 'ACTIVE' ORDER BY seq",
         (line_id, start_seq),
     ).fetchall()
     result = []
@@ -148,12 +152,15 @@ def _load_batches(conn, line_id: str, start_seq: int) -> list[dict[str, Any]]:
 
 
 def _previous_actual(conn, line_id: str, start_seq: int) -> list[str]:
-    """start_seq 之前最近一批的实际过敏原（不存在则为空）。"""
+    """start_seq 之前最近一个有效批次的实际过敏原（不存在则为空）。
+
+    已作废批次不残留传递，查找上一批时同样跳过。
+    """
     row = conn.execute(
         """
         SELECT a.actual FROM adjudication a
         JOIN batch b ON b.batch_no = a.batch_no
-        WHERE b.line_id = ? AND b.seq < ?
+        WHERE b.line_id = ? AND b.seq < ? AND b.status = 'ACTIVE'
         ORDER BY b.seq DESC LIMIT 1
         """,
         (line_id, start_seq),
@@ -404,13 +411,16 @@ def _advance_shipment(
 
 
 def _advance_shipment_for_lot(conn, lot_no: str, trigger: str) -> list[dict[str, Any]]:
-    """批号锁定状态实际变化：所有直接使用该批号的批次出货资格版本一律递增
+    """批号锁定状态实际变化：所有直接使用该批号的有效批次出货资格版本一律递增
     （即使该批仍被其他锁定批号连带 BLOCKED、资格结论未翻转）。
+
+    已作废批次冻结保留、不再参与当前资格统计，不产生新资格版本。
     """
     rows = conn.execute(
         """SELECT b.batch_no AS batch_no, b.line_id AS line_id, b.seq AS seq
            FROM batch_material bm JOIN batch b ON b.batch_no = bm.batch_no
-           WHERE bm.lot_no = ? ORDER BY b.line_id, b.seq""",
+           WHERE bm.lot_no = ? AND b.status = 'ACTIVE'
+           ORDER BY b.line_id, b.seq""",
         (lot_no,),
     ).fetchall()
     affected = []
@@ -452,6 +462,48 @@ def _flip_confirmed_verifications(conn, batch_nos: list[str]) -> None:
     )
 
 
+def _voided_batches_in_verification(conn, verification_no: str) -> list[dict[str, Any]]:
+    """核验单所含的已作废批次（按单据内顺序），含作废原因与时间。"""
+    return [
+        {
+            "batch_no": r["batch_no"],
+            "position": r["position"],
+            "voided_reason": r["voided_reason"],
+            "voided_at": r["voided_at"],
+        }
+        for r in conn.execute(
+            """SELECT vb.batch_no AS batch_no, vb.position AS position,
+                      b.voided_reason AS voided_reason, b.voided_at AS voided_at
+               FROM verification_batch vb
+               JOIN batch b ON b.batch_no = vb.batch_no
+               WHERE vb.verification_no = ? AND b.status = 'VOIDED'
+               ORDER BY vb.position""",
+            (verification_no,),
+        ).fetchall()
+    ]
+
+
+def _reject_if_contains_voided(conn, verification_no: str) -> None:
+    """含作废批次的已有单据可查询，但重新核验和确认均拒绝。"""
+    voided = _voided_batches_in_verification(conn, verification_no)
+    if voided:
+        raise conflict(
+            "VERIFICATION_CONTAINS_VOIDED_BATCH",
+            "核验单含有已作废批次，重新核验与确认均被拒绝；单据仍可查询",
+            [
+                {
+                    "batch_no": v["batch_no"],
+                    "position": v["position"],
+                    "reason_code": "BATCH_VOIDED",
+                    "message": "批次已作废（误登记未投产），不再参与核验",
+                    "voided_reason": v["voided_reason"],
+                    "voided_at": v["voided_at"],
+                }
+                for v in voided
+            ],
+        )
+
+
 # ---------------------------------------------------------------- 序列化
 
 
@@ -460,14 +512,19 @@ def _batch_full(conn, row) -> dict[str, Any]:
         "SELECT * FROM adjudication WHERE batch_no = ?", (row["batch_no"],)
     ).fetchone()
     ship = _get_shipment(conn, row["batch_no"])
+    voided = row["status"] == "VOIDED"
     return {
         "batch_no": row["batch_no"],
         "line_id": row["line_id"],
         "seq": row["seq"],
+        "status": row["status"],
+        "voided": voided,
         "material_lots": loads(row["material_lots"]),
         "declared_allergens": loads(row["declared"]),
         "cleaned_allergens": loads(row["cleaned"]),
         "created_at": row["created_at"],
+        "voided_reason": row["voided_reason"],
+        "voided_at": row["voided_at"],
         "adjudication": _adj_payload(adj) if adj else None,
         "shipment_eligibility": _shipment_payload(ship),
     }
@@ -560,11 +617,13 @@ class Service:
             recomputed = []
             # 仅过敏原集合实际变化才会影响裁决；只改名称不产生新版本
             if new_allergens != old_allergens:
-                # 受影响产线：引用该批号的最小 seq；每条产线各自从该点重算
+                # 受影响产线：引用该批号的最小 seq；每条产线各自从该点重算。
+                # 作废批次不参与裁决，不构成重算起点。
                 refs = conn.execute(
                     """SELECT b.line_id AS line_id, MIN(b.seq) AS start_seq
                        FROM batch_material bm JOIN batch b ON b.batch_no = bm.batch_no
-                       WHERE bm.lot_no = ? GROUP BY b.line_id ORDER BY b.line_id""",
+                       WHERE bm.lot_no = ? AND b.status = 'ACTIVE'
+                       GROUP BY b.line_id ORDER BY b.line_id""",
                     (lot_no,),
                 ).fetchall()
                 for ref in refs:
@@ -794,6 +853,11 @@ class Service:
             row = conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone()
             if not row:
                 raise not_found("CORRECTION_TARGET_NOT_FOUND", f"更正目标不存在，批次号: {batch_no}")
+            if row["status"] == "VOIDED":
+                raise conflict(
+                    "BATCH_VOIDED",
+                    f"批次已作废，不可更正: {batch_no}（作废保留可查，批次号不可复用）",
+                )
 
             new_lots = (
                 _normalize_str_list(material_lots, "material_lots")
@@ -872,6 +936,68 @@ class Service:
         """专用入口：仅更正“批次开始前清洁核验确认清除的过敏原”。"""
         return self.correct_batch(batch_no, None, None, cleaned_allergens)
 
+    def void_batch(self, batch_no: str, reason: str) -> dict[str, Any]:
+        """作废误登记、实际未投产的批次。
+
+        - 作废保留原登记、历史裁决与出货资格以及作废原因供查询，批次号不可复用；
+        - 作废批次不再参与同线残留传递：其后有效批次按原登记顺序重算并追加裁决版本；
+        - 涉及这些批次（或作废批次本身）的已确认核验单立即转待复核；
+          历次确认快照不改；
+        - 重复作废幂等：返回既有作废结果，不重算、不追加任何版本；
+        - 未知批次 404、空原因 400；失败整体回滚，不留下部分版本。
+        """
+        batch_no = (batch_no or "").strip()
+        reason = (reason or "").strip()
+        if not reason:
+            raise bad_request("INVALID_PAYLOAD", "reason 不能为空：批次作废必须填写原因")
+        with self.store.write() as conn:
+            row = conn.execute(
+                "SELECT * FROM batch WHERE batch_no = ?", (batch_no,)
+            ).fetchone()
+            if not row:
+                raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+
+            # 重复作废：返回既有结果，幂等且不重算
+            if row["status"] == "VOIDED":
+                full = _batch_full(conn, row)
+                return {
+                    "voided": full,
+                    "changed": False,
+                    "reason": row["voided_reason"],
+                    "recomputed": [],
+                    "affected_verifications": _affected_verifications(conn, [batch_no]),
+                }
+
+            now = _now()
+            conn.execute(
+                """UPDATE batch SET status='VOIDED', voided_reason=?, voided_at=?
+                   WHERE batch_no=?""",
+                (reason, now, batch_no),
+            )
+
+            # 作废批次退出同线残留链：从其后一批起按原顺序重算（重算本身跳过作废批次）
+            recomputed = recompute_from(conn, row["line_id"], row["seq"] + 1, "VOID_BATCH")
+
+            # 作废批次本身不被重算，但涉及它的已确认核验单同样必须转待复核
+            _flip_confirmed_verifications(conn, [batch_no])
+
+            affected = _affected_verifications(
+                conn,
+                sorted({batch_no, *(s["batch_no"] for s in recomputed)}),
+            )
+            full = _batch_full(
+                conn,
+                conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone(),
+            )
+
+        return {
+            "voided": full,
+            "changed": True,
+            "reason": reason,
+            "recomputed": recomputed,
+            "affected_verifications": affected,
+        }
+
     def batch_history(self, batch_no: str) -> dict[str, Any]:
         with self.store.read() as conn:
             row = conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone()
@@ -885,6 +1011,10 @@ class Service:
                 "batch_no": batch_no,
                 "line_id": row["line_id"],
                 "seq": row["seq"],
+                "status": row["status"],
+                "voided": row["status"] == "VOIDED",
+                "voided_reason": row["voided_reason"],
+                "voided_at": row["voided_at"],
                 "history": [
                     {
                         "version": v["version"],
@@ -925,17 +1055,15 @@ class Service:
                 )
         with self.store.read() as conn:
             sql = """SELECT b.* FROM batch b
-                     JOIN shipment_eligibility se ON se.batch_no = b.batch_no"""
+                     JOIN shipment_eligibility se ON se.batch_no = b.batch_no
+                     WHERE b.status = 'ACTIVE'"""
             params: list[Any] = []
-            where = []
             if line_id:
-                where.append("b.line_id = ?")
+                sql += " AND b.line_id = ?"
                 params.append(line_id)
             if status:
-                where.append("se.status = ?")
+                sql += " AND se.status = ?"
                 params.append(status)
-            if where:
-                sql += " WHERE " + " AND ".join(where)
             sql += " ORDER BY b.line_id, b.seq"
             rows = conn.execute(sql, params).fetchall()
             return {"eligibilities": [_eligibility_payload(conn, r) for r in rows]}
@@ -982,6 +1110,30 @@ class Service:
             if unknown:
                 raise bad_request(
                     "UNKNOWN_BATCH", f"未知批次（未登记）: {', '.join(unknown)}"
+                )
+
+            # 作废批次不再参与新核验
+            voided = [
+                r["batch_no"]
+                for r in conn.execute(
+                    f"""SELECT batch_no FROM batch
+                        WHERE batch_no IN ({placeholders}) AND status = 'VOIDED'
+                        ORDER BY batch_no""",
+                    normalized,
+                ).fetchall()
+            ]
+            if voided:
+                raise bad_request(
+                    "BATCH_VOIDED",
+                    f"批次已作废，不能加入新核验单: {', '.join(voided)}",
+                    [
+                        {
+                            "batch_no": bn,
+                            "reason_code": "BATCH_VOIDED",
+                            "message": "批次已作废（误登记未投产），不再参与新核验",
+                        }
+                        for bn in voided
+                    ],
                 )
 
             now = _now()
@@ -1050,6 +1202,7 @@ class Service:
                     "VERIFICATION_ALREADY_CONFIRMED",
                     "已确认单据不能重新核验；如所含批次产生新裁决版本，单据会自动转待复核",
                 )
+            _reject_if_contains_voided(conn, verification_no)
             batch_nos = [
                 r["batch_no"]
                 for r in conn.execute(
@@ -1085,6 +1238,8 @@ class Service:
                     "VERIFICATION_ALREADY_CONFIRMED",
                     f"出货核验单已确认: {verification_no}",
                 )
+
+            _reject_if_contains_voided(conn, verification_no)
 
             mismatches: list[dict[str, Any]] = []
             for b in _verification_batches(conn, verification_no):
@@ -1263,6 +1418,7 @@ _TRIGGER_LABELS = {
     "REGISTER": "登记批次时裁决",
     "CORRECT_BATCH": "批次更正重算",
     "CORRECT_LOT": "原料批号更正重算",
+    "VOID_BATCH": "同线批次作废后按序重算",
     "LOT_LOCK": "原料批号待检锁定",
     "LOT_UNLOCK": "原料批号解除待检锁定",
     "UPGRADE_INIT": "旧库升级初始资格",
@@ -1357,6 +1513,10 @@ def _eligibility_payload(conn, batch_row) -> dict[str, Any]:
         "batch_no": batch_row["batch_no"],
         "line_id": batch_row["line_id"],
         "seq": batch_row["seq"],
+        "status": batch_row["status"],
+        "voided": batch_row["status"] == "VOIDED",
+        "voided_reason": batch_row["voided_reason"],
+        "voided_at": batch_row["voided_at"],
         "eligibility": _shipment_payload(se),
         "history": [
             {
@@ -1471,7 +1631,8 @@ def _verification_batches(conn, verification_no: str) -> list[dict[str, Any]]:
                   vb.snapshot_ship_status AS snapshot_ship_status,
                   vb.snapshot_locked_lots AS snapshot_locked_lots,
                   vb.snapshot_ship_reasons AS snapshot_ship_reasons,
-                  b.line_id AS line_id, b.seq AS seq,
+                  b.line_id AS line_id, b.seq AS seq, b.status AS batch_status,
+                  b.voided_reason AS voided_reason, b.voided_at AS voided_at,
                   a.version AS current_version, a.disposition AS current_disposition,
                   a.actual AS current_actual, a.undeclared AS current_undeclared,
                   a.reasons AS current_reasons, a.decided_at AS current_decided_at,
@@ -1530,6 +1691,10 @@ def _verification_batches(conn, verification_no: str) -> list[dict[str, Any]]:
                 "batch_no": r["batch_no"],
                 "line_id": r["line_id"],
                 "seq": r["seq"],
+                "status": r["batch_status"],
+                "voided": r["batch_status"] == "VOIDED",
+                "voided_reason": r["voided_reason"],
+                "voided_at": r["voided_at"],
                 "snapshot": {
                     "version": r["snapshot_version"],
                     "disposition": r["snapshot_disposition"],
@@ -1598,13 +1763,17 @@ def _confirmation_history(conn, verification_no: str) -> list[dict[str, Any]]:
 
 
 def _verification_payload(conn, row, *, with_history: bool = True) -> dict[str, Any]:
+    batches = _verification_batches(conn, row["verification_no"])
+    voided_batches = [b["batch_no"] for b in batches if b["voided"]]
     payload = {
         "verification_no": row["verification_no"],
         "status": row["status"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "confirmed_at": row["confirmed_at"],
-        "batches": _verification_batches(conn, row["verification_no"]),
+        "contains_voided_batches": bool(voided_batches),
+        "voided_batches": voided_batches,
+        "batches": batches,
     }
     if with_history:
         payload["confirmations"] = _confirmation_history(conn, row["verification_no"])

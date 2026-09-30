@@ -10,6 +10,7 @@ from .errors import APIError
 from .schemas import (
     BatchCorrection,
     BatchIn,
+    BatchVoidIn,
     CleaningCorrection,
     LotLockIn,
     MaterialLotCorrection,
@@ -137,6 +138,17 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def correct_cleaning(batch_no: str, body: CleaningCorrection, service: Service = Depends(svc)):
         """专用：更正“批次开始前清洁核验确认清除的过敏原”。"""
         return service.correct_cleaning(batch_no, body.cleaned_allergens)
+
+    @app.post("/api/batches/{batch_no}/void", tags=["批次作废"])
+    def void_batch(batch_no: str, body: BatchVoidIn, service: Service = Depends(svc)):
+        """作废误登记、实际未投产的批次（必须填写非空原因）。
+
+        作废保留原登记、历史裁决与资格及原因供查询，批次号不可复用；
+        作废批次退出同线残留链，其后有效批次按序重算并追加版本；
+        涉及的已确认核验单转待复核，历次确认快照不改；重复作废幂等不重算。
+        未知批次 404、空原因 400，失败不留下部分版本。
+        """
+        return service.void_batch(batch_no, body.reason)
 
     @app.get("/api/batches/{batch_no}/history", tags=["批次"])
     def batch_history(batch_no: str, service: Service = Depends(svc)):

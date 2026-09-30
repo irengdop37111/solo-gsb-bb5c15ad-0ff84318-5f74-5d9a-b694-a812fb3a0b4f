@@ -39,11 +39,16 @@ CREATE TABLE IF NOT EXISTS batch (
     material_lots    TEXT NOT NULL DEFAULT '[]',   -- JSON 数组，原料批号
     declared         TEXT NOT NULL DEFAULT '[]',   -- JSON 数组，声明过敏原
     cleaned          TEXT NOT NULL DEFAULT '[]',   -- JSON 数组，本次清洁确认清除的过敏原
+    status           TEXT NOT NULL DEFAULT 'ACTIVE', -- ACTIVE=有效 / VOIDED=已作废（保留可查，批次号不可复用）
+    voided_reason    TEXT,                          -- 作废原因（作废时非空，只追加不改）
+    voided_at        TEXT,                          -- 作废时间
     created_at       TEXT NOT NULL,
     UNIQUE(line_id, seq)
 );
 
 CREATE INDEX IF NOT EXISTS idx_batch_line_seq ON batch(line_id, seq);
+-- idx_batch_status 引用作废功能新增的 status 列；为避免旧库在建表阶段
+-- 引用尚未迁移的列，该索引在 initialize() 完成列迁移后通过 _migrate_indexes 幂等创建。
 
 CREATE TABLE IF NOT EXISTS batch_material (
     batch_no  TEXT NOT NULL REFERENCES batch(batch_no),
@@ -275,6 +280,9 @@ class Store:
 # 旧库（早于批号锁定功能）升级时需要补齐的列：
 # (表名, 列名, 列定义)。逐列检查 sqlite_master，幂等添加。
 _MIGRATION_COLUMNS = [
+    ("batch", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
+    ("batch", "voided_reason", "TEXT"),
+    ("batch", "voided_at", "TEXT"),
     ("verification_batch", "snapshot_ship_version", "INTEGER"),
     ("verification_batch", "snapshot_ship_status", "TEXT"),
     ("verification_batch", "snapshot_locked_lots", "TEXT NOT NULL DEFAULT '[]'"),
@@ -284,6 +292,11 @@ _MIGRATION_COLUMNS = [
     ("verification_confirmation_batch", "snapshot_locked_lots", "TEXT NOT NULL DEFAULT '[]'"),
     ("verification_confirmation_batch", "snapshot_ship_reasons", "TEXT NOT NULL DEFAULT '[]'"),
 ]
+
+
+def _migrate_indexes(conn) -> None:
+    """旧库升级：补齐后续版本新增的索引（IF NOT EXISTS，幂等）。"""
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_status ON batch(status)")
 
 
 def _migrate_columns(conn) -> None:
@@ -371,6 +384,8 @@ def initialize(store: Store, seed_demo: bool = False) -> None:
     # 旧库升级时也必须执行，以便补齐后续版本新增的表与列。
     conn.executescript(SCHEMA)
     _migrate_columns(conn)
+    # 新索引引用迁移后新增的列：必须在列迁移补齐后再建（旧库升级场景）
+    _migrate_indexes(conn)
     _backfill_eligibility(store)
     with store.write():
         conn.executemany(
